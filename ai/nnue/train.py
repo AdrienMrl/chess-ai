@@ -37,6 +37,14 @@ TIME_LIMIT_SECONDS = 5 * 60
 PRINT_EVERY = 200
 SEED = 0
 
+# Overfitting guards: held-out validation split, decoupled weight decay
+# (AdamW-style, applied to the weight matrices only, not biases), and early
+# stopping on validation loss -- the saved weights are the best-val-loss
+# snapshot, not just whatever the last epoch happened to produce.
+VAL_FRACTION = 0.15
+WEIGHT_DECAY = 1e-4
+PATIENCE_EPOCHS = 800
+
 
 def load_dataset():
     """Reads ai/data/positions.jsonl and returns (X, y) as float32 arrays.
@@ -103,10 +111,18 @@ def forward(X, W1, b1, W2, b2):
 def train():
     print(f"Loading dataset from {DATA_PATH} ...")
     X, y = load_dataset()
-    n = X.shape[0]
-    print(f"Loaded {n} positions.")
+    n_total = X.shape[0]
+    print(f"Loaded {n_total} positions.")
 
     rng = np.random.default_rng(SEED)
+    perm = rng.permutation(n_total)
+    n_val = max(1, int(n_total * VAL_FRACTION))
+    val_idx, train_idx = perm[:n_val], perm[n_val:]
+    X_train, y_train = X[train_idx], y[train_idx]
+    X_val, y_val = X[val_idx], y[val_idx]
+    n = X_train.shape[0]
+    print(f"Split: {n} train / {n_val} val.")
+
     W1, b1, W2, b2 = init_params(rng)
 
     # Adam moment buffers (per-parameter adaptive step size -- this keeps
@@ -117,21 +133,26 @@ def train():
     m = {k: np.zeros_like(v) for k, v in params.items()}
     v = {k: np.zeros_like(v) for k, v in params.items()}
 
-    y_col = y.reshape(-1, 1)
+    y_train_col = y_train.reshape(-1, 1)
+    y_val_col = y_val.reshape(-1, 1)
+
+    best_val_loss = float("inf")
+    best_params = None
+    epochs_since_improve = 0
 
     start = time.time()
     epoch = 0
-    final_loss = None
+    train_loss = None
+    val_loss = None
     while epoch < MAX_EPOCHS:
         elapsed = time.time() - start
         if elapsed > TIME_LIMIT_SECONDS:
             print(f"Time limit ({TIME_LIMIT_SECONDS}s) reached, stopping.")
             break
 
-        z1, h1, out = forward(X, params["W1"], params["b1"], params["W2"], params["b2"])
-        diff = out - y_col  # (N, 1)
-        loss = float(np.mean(diff ** 2))
-        final_loss = loss
+        z1, h1, out = forward(X_train, params["W1"], params["b1"], params["W2"], params["b2"])
+        diff = out - y_train_col  # (N, 1)
+        train_loss = float(np.mean(diff ** 2))
 
         # Backprop: MSE -> linear layer 2 -> ReLU -> linear layer 1.
         d_out = (2.0 / n) * diff              # (N, 1)
@@ -140,7 +161,7 @@ def train():
 
         d_h1 = d_out @ params["W2"].T         # (N, HIDDEN)
         d_z1 = d_h1 * (z1 > 0)                # ReLU grad
-        gW1 = X.T @ d_z1                      # (768, HIDDEN)
+        gW1 = X_train.T @ d_z1                # (768, HIDDEN)
         gb1 = d_z1.sum(axis=0)                # (HIDDEN,)
 
         grads = {"W1": gW1, "b1": gb1, "W2": gW2, "b2": gb2}
@@ -151,19 +172,36 @@ def train():
             m_hat = m[k] / (1 - ADAM_BETA1 ** t)
             v_hat = v[k] / (1 - ADAM_BETA2 ** t)
             params[k] = params[k] - LEARNING_RATE * m_hat / (np.sqrt(v_hat) + ADAM_EPS)
+            if k in ("W1", "W2"):  # decoupled weight decay, weights only
+                params[k] = params[k] - LEARNING_RATE * WEIGHT_DECAY * params[k]
+
+        _, _, val_out = forward(X_val, params["W1"], params["b1"], params["W2"], params["b2"])
+        val_loss = float(np.mean((val_out - y_val_col) ** 2))
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_params = {k: v_.copy() for k, v_ in params.items()}
+            epochs_since_improve = 0
+        else:
+            epochs_since_improve += 1
 
         if epoch % PRINT_EVERY == 0 or epoch == MAX_EPOCHS - 1:
-            print(f"epoch {epoch:4d}  loss={loss:.2f}  rmse={np.sqrt(loss):.2f}  elapsed={elapsed:.1f}s")
+            print(f"epoch {epoch:4d}  train_loss={train_loss:.2f} (rmse={np.sqrt(train_loss):.2f})  "
+                  f"val_loss={val_loss:.2f} (rmse={np.sqrt(val_loss):.2f})  elapsed={elapsed:.1f}s")
+
+        if epochs_since_improve >= PATIENCE_EPOCHS:
+            print(f"No val improvement for {PATIENCE_EPOCHS} epochs, early stopping at epoch {epoch}.")
+            break
 
         epoch += 1
 
-    W1, b1, W2, b2 = params["W1"], params["b1"], params["W2"], params["b2"]
-
     total_time = time.time() - start
-    print(f"Training finished after {epoch} epochs, {total_time:.1f}s, final loss={final_loss:.2f} "
-          f"(rmse={np.sqrt(final_loss):.2f} cp).")
+    final_params = best_params if best_params is not None else params
+    print(f"Training finished after {epoch} epochs, {total_time:.1f}s. "
+          f"Best val_loss={best_val_loss:.2f} (rmse={np.sqrt(best_val_loss):.2f} cp) "
+          f"-- saving best-val-loss snapshot, not the final epoch's weights.")
 
-    np.savez(WEIGHTS_PATH, W1=W1, b1=b1, W2=W2, b2=b2)
+    np.savez(WEIGHTS_PATH, **final_params)
     print(f"Saved weights to {WEIGHTS_PATH}")
 
 
