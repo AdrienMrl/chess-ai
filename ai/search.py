@@ -109,12 +109,15 @@ def quiescence(board, alpha, beta, ply, deadline, eval_fn, qdepth=6):
     if qdepth <= 0 or ply >= MAX_PLY - 1:
         return alpha
 
-    captures = [m for m in board.legal_moves() if is_capture(board, m)]
-    captures.sort(key=lambda m: _mvv_lva_score(board, m), reverse=True)
+    pseudo_captures = [m for m in board.pseudo_legal_moves() if is_capture(board, m)]
+    pseudo_captures.sort(key=lambda m: _mvv_lva_score(board, m), reverse=True)
 
-    for m in captures:
+    color = board.turn
+    for m in pseudo_captures:
         undo = board._make(m)
         try:
+            if board.is_attacked(board.king_square(color), 1 - color):
+                continue
             score = -quiescence(board, -beta, -alpha, ply + 1, deadline, eval_fn, qdepth - 1)
         finally:
             board._unmake(undo)
