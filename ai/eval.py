@@ -4,7 +4,18 @@ evaluate(board) returns centipawns from White's perspective (positive = White
 better). This is the guaranteed-working eval; ai/nnue/nnue_eval.py is an
 optional, additive upgrade that falls back to this on any failure.
 """
-from chess_game import WHITE, sq, file_of, rank_of
+from chess_game import (
+    WHITE,
+    BLACK,
+    sq,
+    file_of,
+    rank_of,
+    name_sq,
+    KNIGHT_DELTAS,
+    KING_DELTAS,
+    BISHOP_DIRS,
+    ROOK_DIRS,
+)
 
 PIECE_VALUES = {"P": 100, "N": 320, "B": 330, "R": 500, "Q": 900, "K": 0}
 
@@ -92,14 +103,104 @@ def _mirror(s):
     return sq(file_of(s), 7 - rank_of(s))
 
 
-def _pseudo_moves_for(board, color):
-    """Pseudo-legal move count for `color`, regardless of whose turn it is."""
-    original_turn = board.turn
-    board.turn = color
-    try:
-        return board.pseudo_legal_moves()
-    finally:
-        board.turn = original_turn
+def _pawn_mobility_count(board, f0, r0, color):
+    direction = 1 if color == WHITE else -1
+    start_rank = 1 if color == WHITE else 6
+    promo_rank = 7 if color == WHITE else 0
+    count = 0
+
+    r1 = r0 + direction
+    if 0 <= r1 < 8 and board.squares[sq(f0, r1)] == ".":
+        count += 4 if r1 == promo_rank else 1
+        if r0 == start_rank:
+            r2 = r0 + 2 * direction
+            if board.squares[sq(f0, r2)] == ".":
+                count += 1
+
+    for df in (-1, 1):
+        f = f0 + df
+        r = r0 + direction
+        if 0 <= f < 8 and 0 <= r < 8:
+            t = sq(f, r)
+            tc = board.color_of(board.squares[t])
+            if tc is not None and tc != color:
+                count += 4 if r == promo_rank else 1
+            elif board.ep is not None and t == board.ep:
+                count += 1
+    return count
+
+
+def _castle_mobility_count(board, s, color):
+    if board.in_check(color):
+        return 0
+    enemy = 1 - color
+    count = 0
+    if color == WHITE and s == name_sq("e1"):
+        if "K" in board.castling and board.squares[name_sq("f1")] == "." and board.squares[name_sq("g1")] == ".":
+            if not board.is_attacked(name_sq("f1"), enemy) and not board.is_attacked(name_sq("g1"), enemy):
+                count += 1
+        if "Q" in board.castling and board.squares[name_sq("d1")] == "." and board.squares[name_sq("c1")] == "." and board.squares[name_sq("b1")] == ".":
+            if not board.is_attacked(name_sq("d1"), enemy) and not board.is_attacked(name_sq("c1"), enemy):
+                count += 1
+    elif color == BLACK and s == name_sq("e8"):
+        if "k" in board.castling and board.squares[name_sq("f8")] == "." and board.squares[name_sq("g8")] == ".":
+            if not board.is_attacked(name_sq("f8"), enemy) and not board.is_attacked(name_sq("g8"), enemy):
+                count += 1
+        if "q" in board.castling and board.squares[name_sq("d8")] == "." and board.squares[name_sq("c8")] == "." and board.squares[name_sq("b8")] == ".":
+            if not board.is_attacked(name_sq("d8"), enemy) and not board.is_attacked(name_sq("c8"), enemy):
+                count += 1
+    return count
+
+
+def _mobility_count(board, color):
+    """Pseudo-legal move count for `color`, regardless of whose turn it is.
+
+    Mirrors chess_game.Board.pseudo_legal_moves()'s move counts exactly (same
+    per-square deltas, same 4-way promotion counting, same castle checks) but
+    only counts destinations instead of allocating a Move object per one —
+    this runs on nearly every node via evaluate(), so avoiding the allocation
+    and list-building matters.
+    """
+    count = 0
+    for s in range(64):
+        c = board.squares[s]
+        if c == "." or board.color_of(c) != color:
+            continue
+        p = c.upper()
+        f0, r0 = file_of(s), rank_of(s)
+        if p == "P":
+            count += _pawn_mobility_count(board, f0, r0, color)
+        elif p == "N":
+            for df, dr in KNIGHT_DELTAS:
+                f, r = f0 + df, r0 + dr
+                if 0 <= f < 8 and 0 <= r < 8:
+                    if board.color_of(board.squares[sq(f, r)]) != color:
+                        count += 1
+        elif p == "K":
+            for df, dr in KING_DELTAS:
+                f, r = f0 + df, r0 + dr
+                if 0 <= f < 8 and 0 <= r < 8:
+                    if board.color_of(board.squares[sq(f, r)]) != color:
+                        count += 1
+            count += _castle_mobility_count(board, s, color)
+        else:
+            dirs = []
+            if p in ("B", "Q"):
+                dirs += BISHOP_DIRS
+            if p in ("R", "Q"):
+                dirs += ROOK_DIRS
+            for df, dr in dirs:
+                f, r = f0 + df, r0 + dr
+                while 0 <= f < 8 and 0 <= r < 8:
+                    tc = board.color_of(board.squares[sq(f, r)])
+                    if tc == color:
+                        break
+                    count += 1
+                    if tc is not None:
+                        break
+                    f += df
+                    r += dr
+    return count
 
 
 def _king_safety(board, color):
@@ -148,8 +249,8 @@ def evaluate(board):
 
     score += _king_safety(board, 0) - _king_safety(board, 1)
 
-    white_mobility = len(_pseudo_moves_for(board, 0))
-    black_mobility = len(_pseudo_moves_for(board, 1))
+    white_mobility = _mobility_count(board, 0)
+    black_mobility = _mobility_count(board, 1)
     score += MOBILITY_WEIGHT * (white_mobility - black_mobility)
 
     score += TEMPO_BONUS if board.turn == WHITE else -TEMPO_BONUS
